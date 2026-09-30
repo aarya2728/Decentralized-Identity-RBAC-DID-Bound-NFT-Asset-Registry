@@ -1,0 +1,34 @@
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+model Identity {
+  address      String   @id
+  didUri       String
+  registeredAt DateTime @default(now())
+}
+
+model Asset {
+  tokenId      Int      @id
+  ownerDid     String
+  tokenUri     String
+  mintedBy     String
+  mintedAt     DateTime @default(now())
+}
+
+model Event {
+  id          String   @id @default(cuid())
+  contract    String
+  eventName   String
+  args        String   // JSON stringified args for SQLite compatibility
+  blockNumber Int
+  txHash      String
+  timestamp   DateTime @default(now())
+
+  @@unique([txHash, eventName])
+}
