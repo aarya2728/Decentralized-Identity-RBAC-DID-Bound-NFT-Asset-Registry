@@ -1,6 +1,6 @@
 node_modules
 .env
-.env.local
+.env.*
 dist
 coverage
 cache
@@ -8,3 +8,7 @@ artifacts
 typechain-types
 .next
 *.log
+*.db
+*.sqlite
+*.tsbuildinfo
+

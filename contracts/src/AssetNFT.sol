@@ -2,37 +2,38 @@
 pragma solidity 0.8.24;
 
 import "@openzeppelin/contracts/token/ERC721/extensions/ERC721URIStorage.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "@chainlink/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol";
 import "./AccessControlManager.sol";
 import "./IdentityRegistry.sol";
 
 /// @title AssetNFT
-/// @notice ERC-721 token registry representing audited digital assets allocated directly to verified DIDs
-/// @dev Composes with AccessControlManager for RBAC and IdentityRegistry for DID resolution.
-contract AssetNFT is ERC721URIStorage {
-    /// @notice Address of the central AccessControlManager
+/// @notice Decentralized Asset Registry (dMRV / Carbon Credits) tied to DIDs with Chainlink Price Feeds
+contract AssetNFT is ERC721URIStorage, ReentrancyGuard {
     AccessControlManager public immutable accessControl;
-    /// @notice Address of the IdentityRegistry
     IdentityRegistry public immutable identityRegistry;
+    AggregatorV3Interface public immutable priceFeed;
 
-    /// @notice Auto-incrementing token identifier counter starting at 1
     uint256 private _nextTokenId = 1;
+    uint256 public constant HEARTBEAT = 24 hours; // Max latency before price is considered stale
 
-    /// @notice Emitted on any state change affecting asset allocation (mint, transfer, burn)
-    /// @param tokenId The unique identifier of the asset
-    /// @param from The previous owner address (address(0) for mints)
-    /// @param to The recipient owner address (address(0) for burns)
-    event AssetAllocated(uint256 indexed tokenId, address indexed from, address indexed to);
+    event AssetMinted(uint256 indexed tokenId, address indexed recipient, string did, string tokenURI);
+    event AssetAllocated(
+        uint256 indexed tokenId,
+        address indexed from,
+        address indexed to,
+        string fromDid,
+        string toDid
+    );
 
-    /// @notice Thrown when caller does not possess the MANAGER_ROLE
     error UnauthorizedManager();
-    /// @notice Thrown when the recipient address has no registered DID in IdentityRegistry
     error RecipientNotRegistered();
-    /// @notice Thrown when a zero address is supplied
     error InvalidAddress();
-    /// @notice Thrown when the metadata URI is empty
     error EmptyTokenURI();
+    error StalePrice();
+    error NegativePrice();
+    error IncompleteRound();
 
-    /// @notice Restricts invocation to accounts holding the MANAGER_ROLE in AccessControlManager
     modifier onlyManager() {
         if (!accessControl.hasRole(accessControl.MANAGER_ROLE(), msg.sender)) {
             revert UnauthorizedManager();
@@ -40,27 +41,56 @@ contract AssetNFT is ERC721URIStorage {
         _;
     }
 
-    /// @notice Deploys the AssetNFT contract
-    /// @param _accessControl Address of the AccessControlManager contract
-    /// @param _identityRegistry Address of the IdentityRegistry contract
-    constructor(address _accessControl, address _identityRegistry)
-        ERC721("Decentralized Asset Registry", "DART")
-    {
+    /// @param _accessControl Address of AccessControlManager
+    /// @param _identityRegistry Address of IdentityRegistry
+    /// @param _priceFeed Sepolia ETH/USD Aggregator address (defaults to 0x694AA1769357215DE4FAC081bf1f309aDC325306 if 0)
+    constructor(
+        address _accessControl,
+        address _identityRegistry,
+        address _priceFeed
+    ) ERC721("Export License", "XLIC") {
         if (_accessControl == address(0) || _identityRegistry == address(0)) {
             revert InvalidAddress();
         }
         accessControl = AccessControlManager(_accessControl);
         identityRegistry = IdentityRegistry(_identityRegistry);
+        priceFeed = AggregatorV3Interface(
+            _priceFeed == address(0)
+                ? 0x694AA1769357215DE4FAC081bf1f309aDC325306
+                : _priceFeed
+        );
     }
 
-    /// @notice Mints a new asset NFT directly to an address with an active DID
-    /// @dev Requires caller to have MANAGER_ROLE and recipient to be registered in IdentityRegistry
-    /// @param recipient The wallet address of the recipient holding a registered DID
-    /// @param tokenURI IPFS or decentralized storage URI containing asset metadata
-    /// @return tokenId The newly minted token ID
+    /// @notice Fetches latest ETH/USD price with stale feed protection
+    /// @return price Latest verified ETH/USD price (8 decimals)
+    function getLatestEthPrice() public view returns (uint256) {
+        (
+            uint80 roundId,
+            int256 price,
+            ,
+            uint256 updatedAt,
+            uint80 answeredInRound
+        ) = priceFeed.latestRoundData();
+
+        if (price <= 0) revert NegativePrice();
+        if (updatedAt == 0 || block.timestamp - updatedAt > HEARTBEAT) revert StalePrice();
+        if (answeredInRound < roundId) revert IncompleteRound();
+
+        return uint256(price);
+    }
+
+    /// @notice Converts an ETH asset valuation (in wei, 18 decimals) into USD (with 8 decimals)
+    /// @param ethAmountInWei Amount of ETH in wei (1e18)
+    /// @return usdValue USD value with 8 decimals (standard Chainlink USD decimals)
+    function getAssetUsdValue(uint256 ethAmountInWei) public view returns (uint256 usdValue) {
+        uint256 ethPriceUsd = getLatestEthPrice(); // 8 decimals
+        return (ethAmountInWei * ethPriceUsd) / 1e18;
+    }
+
     function mintToIdentity(address recipient, string calldata tokenURI)
         external
         onlyManager
+        nonReentrant
         returns (uint256 tokenId)
     {
         if (recipient == address(0)) {
@@ -77,29 +107,34 @@ contract AssetNFT is ERC721URIStorage {
         _safeMint(recipient, tokenId);
         _setTokenURI(tokenId, tokenURI);
 
+        emit AssetMinted(tokenId, recipient, identityRegistry.resolveDID(recipient), tokenURI);
         return tokenId;
     }
 
-    /// @notice Resolves the DID URI of the current owner of an asset
-    /// @param tokenId The identifier of the asset NFT
-    /// @return The DID URI resolved via IdentityRegistry
     function currentOwnerDID(uint256 tokenId) external view returns (string memory) {
         address owner = ownerOf(tokenId);
         return identityRegistry.resolveDID(owner);
     }
 
-    /// @notice Overrides ERC721 v5 update hook to emit custom AssetAllocated event on mint, transfer, and burn
-    /// @param to Recipient address
-    /// @param tokenId The asset token ID
-    /// @param auth Authorized operator or owner
-    /// @return The previous owner address
-    function _update(
-        address to,
-        uint256 tokenId,
-        address auth
-    ) internal virtual override returns (address) {
+    function _didOf(address account) internal view returns (string memory) {
+        if (account == address(0) || !identityRegistry.isRegistered(account)) {
+            return "";
+        }
+        return identityRegistry.resolveDID(account);
+    }
+
+    function _update(address to, uint256 tokenId, address auth)
+        internal
+        virtual
+        override
+        returns (address)
+    {
+        if (to != address(0) && !identityRegistry.isRegistered(to)) {
+            revert RecipientNotRegistered();
+        }
+
         address from = super._update(to, tokenId, auth);
-        emit AssetAllocated(tokenId, from, to);
+        emit AssetAllocated(tokenId, from, to, _didOf(from), _didOf(to));
         return from;
     }
 }

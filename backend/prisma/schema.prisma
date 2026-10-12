@@ -10,11 +10,14 @@ generator client {
 model Identity {
   address      String   @id
   didUri       String
+  pubKeyHash   String   @default("")
+  revoked      Boolean  @default(false)
   registeredAt DateTime @default(now())
 }
 
 model Asset {
   tokenId      Int      @id
+  ownerAddress String   @default("")
   ownerDid     String
   tokenUri     String
   mintedBy     String
@@ -25,10 +28,26 @@ model Event {
   id          String   @id @default(cuid())
   contract    String
   eventName   String
-  args        String   // JSON stringified args for SQLite compatibility
+  args        String
   blockNumber Int
   txHash      String
+  logIndex    Int      @default(0)
   timestamp   DateTime @default(now())
 
-  @@unique([txHash, eventName])
+  @@unique([txHash, logIndex])
+}
+
+model MetadataPin {
+  cid      String   @id
+  ipfsUri  String
+  payload  String
+  pinnedAt DateTime @default(now())
+}
+
+model IndexerCheckpoint {
+  id        String   @id @default("default")
+  lastBlock Int      @default(0)
+  chainHead Int      @default(0)
+  lastError String   @default("")
+  updatedAt DateTime @updatedAt
 }

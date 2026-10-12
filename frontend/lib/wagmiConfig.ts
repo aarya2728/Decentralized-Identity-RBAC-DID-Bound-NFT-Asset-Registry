@@ -1,10 +1,9 @@
-import { http, createConfig } from "wagmi";
+import { getDefaultConfig } from "@rainbow-me/rainbowkit";
 import { sepolia, hardhat } from "wagmi/chains";
 
-export const config = createConfig({
+export const wagmiConfig = getDefaultConfig({
+  appName: "Monad DID & Asset Registry",
+  projectId: process.env.NEXT_PUBLIC_WALLETCONNECT_PROJECT_ID || "demo-project-id",
   chains: [sepolia, hardhat],
-  transports: {
-    [sepolia.id]: http(process.env.NEXT_PUBLIC_SEPOLIA_RPC_URL || "https://rpc.sepolia.org"),
-    [hardhat.id]: http("http://127.0.0.1:8545"),
-  },
+  ssr: true,
 });

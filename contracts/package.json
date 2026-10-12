@@ -11,6 +11,7 @@
     "seed": "hardhat run scripts/seed.ts --network localhost"
   },
   "devDependencies": {
+    "@chainlink/contracts": "^1.2.0",
     "@nomicfoundation/hardhat-toolbox": "^5.0.0",
     "@openzeppelin/contracts": "^5.0.2",
     "dotenv": "^16.4.5",

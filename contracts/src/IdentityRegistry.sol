@@ -1,36 +1,47 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.24;
 
+import { FunctionsClient } from "@chainlink/contracts/src/v0.8/functions/v1_0_0/FunctionsClient.sol";
+import { FunctionsRequest } from "@chainlink/contracts/src/v0.8/functions/v1_0_0/libraries/FunctionsRequest.sol";
+
 /// @title IdentityRegistry
-/// @notice Decentralized Identity (DID) Registry mapping wallet addresses to DID URIs and public key hashes
-/// @dev Stores strictly off-chain pointers and cryptographic hashes — zero PII stored on-chain.
-contract IdentityRegistry {
+/// @notice Decentralized Identity Registry integrated with Chainlink Functions for off-chain credential verification
+contract IdentityRegistry is FunctionsClient {
+    using FunctionsRequest for FunctionsRequest.Request;
+
     struct Identity {
         string didUri;
         bytes32 pubKeyHash;
         uint256 registeredAt;
         bool exists;
+        bool isVerified;
+        uint256 verifiedAt;
     }
 
-    /// @notice Address => Identity record
     mapping(address => Identity) private _identities;
+    mapping(bytes32 => address) private _pendingRequests;
 
-    /// @notice Emitted when a new identity is registered
-    /// @param user The wallet address registering the DID
-    /// @param didUri The URI pointing to the DID document (e.g., IPFS CID or did:ethr identifier)
-    /// @param pubKeyHash SHA-256 / Keccak256 hash of the public key or verification material
     event IdentityCreated(address indexed user, string didUri, bytes32 pubKeyHash);
+    event IdentityUpdated(address indexed user, string didUri, bytes32 pubKeyHash);
+    event IdentityRevoked(address indexed user);
+    event VerificationRequested(bytes32 indexed requestId, address indexed user);
+    event IdentityVerified(address indexed user, bytes32 indexed requestId, bool success);
+    event RequestFailed(bytes32 indexed requestId, bytes error);
 
-    /// @notice Thrown when attempting to register an address that already has an identity
     error AlreadyRegistered();
-    /// @notice Thrown when the provided DID URI is empty
     error EmptyDID();
-    /// @notice Thrown when querying an address that is not registered
     error NotRegistered();
+    error RequestNotFound();
 
-    /// @notice Registers an identity for the caller
-    /// @param didUri Resolvable DID pointer (e.g. IPFS URI or did:ethr format)
-    /// @param pubKeyHash Hash of the cryptographic public key for off-chain credential verification
+    /// @param router Sepolia Functions Router: defaults to 0xb83E47c2bC239B3bf370bc41e1459A34b41238D0 if 0
+    constructor(address router)
+        FunctionsClient(
+            router == address(0)
+                ? 0xb83E47C2bC239B3bf370bc41e1459A34b41238D0
+                : router
+        )
+    {}
+
     function registerIdentity(string calldata didUri, bytes32 pubKeyHash) external {
         if (bytes(didUri).length == 0) {
             revert EmptyDID();
@@ -43,15 +54,90 @@ contract IdentityRegistry {
             didUri: didUri,
             pubKeyHash: pubKeyHash,
             registeredAt: block.timestamp,
-            exists: true
+            exists: true,
+            isVerified: false,
+            verifiedAt: 0
         });
 
         emit IdentityCreated(msg.sender, didUri, pubKeyHash);
     }
 
-    /// @notice Resolves the DID URI associated with a given user address
-    /// @param user Address to resolve
-    /// @return didUri The registered DID URI
+    function updateIdentity(string calldata didUri, bytes32 pubKeyHash) external {
+        if (bytes(didUri).length == 0) {
+            revert EmptyDID();
+        }
+        if (!_identities[msg.sender].exists) {
+            revert NotRegistered();
+        }
+
+        _identities[msg.sender].didUri = didUri;
+        _identities[msg.sender].pubKeyHash = pubKeyHash;
+
+        emit IdentityUpdated(msg.sender, didUri, pubKeyHash);
+    }
+
+    function revokeIdentity() external {
+        if (!_identities[msg.sender].exists) {
+            revert NotRegistered();
+        }
+
+        _identities[msg.sender].exists = false;
+        _identities[msg.sender].isVerified = false;
+        emit IdentityRevoked(msg.sender);
+    }
+
+    /// @notice Initiates off-chain verification request via Chainlink Functions
+    function requestVerification(
+        string calldata source,
+        bytes calldata encryptedSecretsUrls,
+        string[] calldata args,
+        uint64 subscriptionId,
+        uint32 callbackGasLimit,
+        bytes32 donId
+    ) external returns (bytes32 requestId) {
+        if (!_identities[msg.sender].exists) revert NotRegistered();
+
+        FunctionsRequest.Request memory req;
+        req.initializeRequestForInlineJavaScript(source);
+        if (encryptedSecretsUrls.length > 0) {
+            req.addSecretsReference(encryptedSecretsUrls);
+        }
+        if (args.length > 0) {
+            req.setArgs(args);
+        }
+
+        requestId = _sendRequest(req.encodeCBOR(), subscriptionId, callbackGasLimit, donId);
+        _pendingRequests[requestId] = msg.sender;
+
+        emit VerificationRequested(requestId, msg.sender);
+        return requestId;
+    }
+
+    /// @notice Callback fulfilled by Chainlink Functions router
+    function fulfillRequest(
+        bytes32 requestId,
+        bytes memory response,
+        bytes memory err
+    ) internal override {
+        address user = _pendingRequests[requestId];
+        if (user == address(0)) revert RequestNotFound();
+        delete _pendingRequests[requestId];
+
+        if (err.length > 0) {
+            emit RequestFailed(requestId, err);
+            return;
+        }
+
+        uint256 verifiedStatus = abi.decode(response, (uint256));
+        if (verifiedStatus == 1) {
+            _identities[user].isVerified = true;
+            _identities[user].verifiedAt = block.timestamp;
+            emit IdentityVerified(user, requestId, true);
+        } else {
+            emit IdentityVerified(user, requestId, false);
+        }
+    }
+
     function resolveDID(address user) external view returns (string memory) {
         if (!_identities[user].exists) {
             revert NotRegistered();
@@ -59,31 +145,33 @@ contract IdentityRegistry {
         return _identities[user].didUri;
     }
 
-    /// @notice Checks if an address is registered in the registry
-    /// @param user Address to check
-    /// @return bool True if registered, false otherwise
     function isRegistered(address user) external view returns (bool) {
         return _identities[user].exists;
     }
 
-    /// @notice Fetches the full identity record for an address
-    /// @param user Address to look up
-    /// @return didUri The DID pointer
-    /// @return pubKeyHash Hash of the public key
-    /// @return registeredAt Block timestamp of registration
+    function isVerified(address user) external view returns (bool) {
+        return _identities[user].isVerified;
+    }
+
     function getIdentity(address user)
         external
         view
         returns (
             string memory didUri,
             bytes32 pubKeyHash,
-            uint256 registeredAt
+            uint256 registeredAt,
+            bool isIdentityVerified
         )
     {
         if (!_identities[user].exists) {
             revert NotRegistered();
         }
         Identity storage idRecord = _identities[user];
-        return (idRecord.didUri, idRecord.pubKeyHash, idRecord.registeredAt);
+        return (
+            idRecord.didUri,
+            idRecord.pubKeyHash,
+            idRecord.registeredAt,
+            idRecord.isVerified
+        );
     }
 }
